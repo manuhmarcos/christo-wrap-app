@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 class ApiService {
   // Cambia esta URL por la de tu backend en Railway una vez deployado
-  static const String baseUrl = 'https://TU-BACKEND.up.railway.app';
+  static const String baseUrl = 'https://christo-wrap-backend-production.up.railway.app';
 
   /// Envia la imagen al backend y devuelve la imagen resultado en bytes.
   /// [imageBytes]: bytes de la imagen original
