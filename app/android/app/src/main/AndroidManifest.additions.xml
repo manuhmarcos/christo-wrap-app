@@ -1,0 +1,9 @@
+&lt;!-- Agregar estos permisos dentro del tag &lt;manifest&gt; de AndroidManifest.xml --&gt;
+
+&lt;uses-permission android:name="android.permission.CAMERA"/&gt;
+&lt;uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/&gt;
+&lt;uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/&gt;
+&lt;uses-permission android:name="android.permission.INTERNET"/&gt;
+
+&lt;!-- En el tag &lt;activity&gt; agregar: --&gt;
+&lt;!-- android:usesCleartextTraffic="true" --&gt;

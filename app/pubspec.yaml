@@ -1,0 +1,29 @@
+name: christo_app
+description: Envuelve objetos al estilo Christo y Jeanne-Claude
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.1.2
+  http: ^1.2.2
+  share_plus: ^10.0.0
+  gallery_saver: ^2.3.2
+  loading_animation_widget: ^1.2.1
+  permission_handler: ^11.3.1
+  cached_network_image: ^3.3.1
+  flutter_image_compress: ^2.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/

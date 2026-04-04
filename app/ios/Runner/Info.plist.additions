@@ -1,0 +1,10 @@
+&lt;!-- Agregar estas claves dentro del dict principal de Info.plist --&gt;
+
+&lt;key&gt;NSCameraUsageDescription&lt;/key&gt;
+&lt;string&gt;Necesitamos acceso a la camara para tomar fotos y envolverlas al estilo Christo&lt;/string&gt;
+
+&lt;key&gt;NSPhotoLibraryUsageDescription&lt;/key&gt;
+&lt;string&gt;Necesitamos acceso a tu galeria para seleccionar y guardar imagenes&lt;/string&gt;
+
+&lt;key&gt;NSPhotoLibraryAddUsageDescription&lt;/key&gt;
+&lt;string&gt;Necesitamos permiso para guardar imagenes en tu galeria&lt;/string&gt;
