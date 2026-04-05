@@ -23,8 +23,6 @@ app.add_middleware(
 )
 
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-
-# SD inpainting works best at these sizes
 SD_SIZE = 512
 
 
@@ -45,104 +43,97 @@ async def download_bytes(url: str) -> bytes:
         return response.content
 
 
-async def download_image(url: str) -> Image.Image:
-    data = await download_bytes(url)
-    return Image.open(BytesIO(data)).convert("RGB")
+def segment_object_grabcut(img_pil: Image.Image) -> Image.Image:
+    """
+    Uses OpenCV GrabCut to segment the main object (no API call needed).
+    Returns a binary mask as PIL Image (L mode, 255=object, 0=background).
+    """
+    img_rgb = np.array(img_pil.convert("RGB"))
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    h, w = img_bgr.shape[:2]
+
+    # Define rect around center (object is assumed to be roughly centered)
+    margin_x = int(w * 0.12)
+    margin_y = int(h * 0.08)
+    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+
+    mask = np.zeros((h, w), np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 8, cv2.GC_INIT_WITH_RECT)
+        # Pixels marked as foreground or probable foreground
+        fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    except Exception:
+        # Fallback: center ellipse
+        fg_mask = np.zeros((h, w), np.uint8)
+        center = (w // 2, h // 2)
+        axes = (int(w * 0.35), int(h * 0.42))
+        cv2.ellipse(fg_mask, center, axes, 0, 0, 360, 255, -1)
+
+    # Morphological cleanup: close small holes, remove noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Keep only the largest connected component
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        fg_mask = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    # Slight dilation so fabric slightly overflows edges
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    fg_mask = cv2.dilate(fg_mask, kernel_dilate, iterations=2)
+
+    # Smooth edges with gaussian blur for natural blending
+    fg_mask_blur = cv2.GaussianBlur(fg_mask, (21, 21), 0)
+
+    return Image.fromarray(fg_mask_blur, mode="L")
 
 
-def extract_canny_edges(img: Image.Image) -> Image.Image:
-    """Extract canny edges from image — used by ControlNet to preserve object shape."""
-    arr = np.array(img.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    # Gaussian blur to reduce noise before edge detection
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
-    # Convert single channel to RGB (ControlNet expects RGB)
-    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    return Image.fromarray(edges_rgb)
-
-
-def resize_to_sd(img: Image.Image) -> Image.Image:
-    """Resize keeping aspect ratio so longest side = SD_SIZE, then pad to square."""
+def resize_for_sd(img: Image.Image):
+    """Resize keeping aspect ratio, pad to SD_SIZE x SD_SIZE."""
     w, h = img.size
     ratio = SD_SIZE / max(w, h)
-    new_w = int(w * ratio)
-    new_h = int(h * ratio)
+    new_w, new_h = int(w * ratio), int(h * ratio)
     resized = img.resize((new_w, new_h), Image.LANCZOS)
-    # Pad to SD_SIZE x SD_SIZE with black
-    padded = Image.new("RGB", (SD_SIZE, SD_SIZE), (0, 0, 0))
-    offset_x = (SD_SIZE - new_w) // 2
-    offset_y = (SD_SIZE - new_h) // 2
-    padded.paste(resized, (offset_x, offset_y))
-    return padded, (offset_x, offset_y, new_w, new_h)
+    canvas = Image.new("RGB", (SD_SIZE, SD_SIZE), (0, 0, 0))
+    ox = (SD_SIZE - new_w) // 2
+    oy = (SD_SIZE - new_h) // 2
+    canvas.paste(resized, (ox, oy))
+    return canvas, (ox, oy, new_w, new_h)
 
 
-def resize_mask_to_sd(mask: Image.Image, offsets: tuple) -> Image.Image:
-    offset_x, offset_y, new_w, new_h = offsets
-    resized = mask.resize((new_w, new_h), Image.NEAREST)
-    padded = Image.new("L", (SD_SIZE, SD_SIZE), 0)
-    padded.paste(resized, (offset_x, offset_y))
-    return padded
+def resize_mask_for_sd(mask: Image.Image, offsets):
+    ox, oy, new_w, new_h = offsets
+    resized = mask.resize((new_w, new_h), Image.BILINEAR)
+    canvas = Image.new("L", (SD_SIZE, SD_SIZE), 0)
+    canvas.paste(resized, (ox, oy))
+    return canvas
 
 
-def crop_and_resize_result(result: Image.Image, offsets: tuple, orig_size: tuple) -> Image.Image:
+def restore_from_sd(result_sd: Image.Image, offsets, orig_size):
     """Undo padding and restore original dimensions."""
-    offset_x, offset_y, new_w, new_h = offsets
-    cropped = result.crop((offset_x, offset_y, offset_x + new_w, offset_y + new_h))
+    ox, oy, new_w, new_h = offsets
+    cropped = result_sd.crop((ox, oy, ox + new_w, oy + new_h))
     return cropped.resize(orig_size, Image.LANCZOS)
-
-
-def create_center_mask(width: int, height: int, coverage: float = 0.55) -> Image.Image:
-    mask = Image.new("L", (width, height), 0)
-    draw = ImageDraw.Draw(mask)
-    margin_x = int(width * (1 - coverage) / 2)
-    margin_y = int(height * (1 - coverage) / 2)
-    draw.ellipse([margin_x, margin_y, width - margin_x, height - margin_y], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=20))
-    return mask
-
-
-def dilate_mask(mask_arr: np.ndarray, pixels: int = 8) -> Image.Image:
-    mask_img = Image.fromarray((mask_arr > 128).astype(np.uint8) * 255, mode="L")
-    for _ in range(max(1, pixels // 5)):
-        mask_img = mask_img.filter(ImageFilter.MaxFilter(7))
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=3))
-    return mask_img
-
-
-def select_best_mask(masks: list, width: int, height: int) -> np.ndarray | None:
-    cx, cy = width / 2, height / 2
-    best_score = -1
-    best_mask = None
-    for arr in masks:
-        area = np.sum(arr > 128)
-        if area == 0:
-            continue
-        ys, xs = np.where(arr > 128)
-        mcx, mcy = np.mean(xs), np.mean(ys)
-        dist = np.sqrt((mcx - cx) ** 2 + (mcy - cy) ** 2)
-        max_dist = np.sqrt(cx**2 + cy**2)
-        centrality = 1 - (dist / (max_dist + 1e-6))
-        score = 0.6 * (area / (width * height)) + 0.4 * centrality
-        if score > best_score:
-            best_score = score
-            best_mask = arr
-    return best_mask
 
 
 def build_prompt(material: str) -> tuple[str, str]:
     if material == "plastico":
         return (
-            "wrapped in shiny transparent polypropylene plastic sheet tied with rope, "
-            "Christo and Jeanne-Claude art style, same object shape preserved under plastic, "
-            "plastic follows exact contours, realistic photography, studio lighting",
-            "deformed, reshaped, different proportions, blob, ugly, blurry, cartoon, text"
+            "wrapped in shiny polypropylene plastic sheeting tied with thick nylon rope, "
+            "Christo and Jeanne-Claude art installation, plastic wrapping follows the exact shape and silhouette, "
+            "photorealistic photograph, natural lighting, high detail",
+            "deformed shape, reshaped, different proportions, blob, ugly, blurry, cartoon, watermark"
         )
     return (
-        "wrapped in white linen cloth fabric tied with rope, "
-        "Christo and Jeanne-Claude art style, same object shape preserved under fabric, "
-        "cloth follows exact contours and silhouette, realistic photography, studio lighting",
-        "deformed, reshaped, different proportions, blob, ugly, blurry, cartoon, text"
+        "wrapped in white linen fabric cloth tied with thick rope, "
+        "Christo and Jeanne-Claude art installation, fabric follows the exact shape and silhouette of the object, "
+        "photorealistic photograph, natural lighting, high detail",
+        "deformed shape, reshaped, different proportions, blob, ugly, blurry, cartoon, watermark"
     )
 
 
@@ -160,122 +151,64 @@ async def wrap_object(
         raise HTTPException(status_code=500, detail="REPLICATE_API_TOKEN no configurado")
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
-    # 1. Load image and fix EXIF rotation
+    # 1. Load and fix orientation
     contents = await file.read()
     try:
-        original_image = Image.open(BytesIO(contents))
-        original_image = ImageOps.exif_transpose(original_image)
-        original_image = original_image.convert("RGB")
+        pil = Image.open(BytesIO(contents))
+        pil = ImageOps.exif_transpose(pil).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Imagen invalida")
 
-    orig_size = original_image.size  # Save for final restore
-    orig_w, orig_h = orig_size
+    orig_size = pil.size
 
-    # 2. Resize to SD_SIZE with padding (preserving aspect ratio)
-    sd_image, offsets = resize_to_sd(original_image)
-    _, _, new_w, new_h = offsets
+    # 2. Segment object locally with GrabCut (no API call)
+    mask_orig = segment_object_grabcut(pil)
 
-    # 3. Extract Canny edges (same size as sd_image)
-    canny_image = extract_canny_edges(sd_image)
+    # 3. Resize image and mask to SD canvas
+    sd_img, offsets = resize_for_sd(pil)
+    sd_mask = resize_mask_for_sd(mask_orig, offsets)
 
-    # 4. Run SAM segmentation on sd_image
-    mask_arr = None
-    try:
-        sam_output = replicate.run(
-            "meta/sam-2",
-            input={
-                "image": pil_to_data_uri(sd_image),
-                "use_m2m": True,
-                "points_per_side": 32,
-                "pred_iou_thresh": 0.86,
-                "stability_score_thresh": 0.92,
-            }
-        )
-        masks = []
-        for item in (list(sam_output) if not isinstance(sam_output, list) else sam_output):
-            url = item if isinstance(item, str) else getattr(item, "url", str(item))
-            if url and url.startswith("http"):
-                try:
-                    mask_img = await download_image(url)
-                    arr = np.array(mask_img.resize((SD_SIZE, SD_SIZE)).convert("L"))
-                    if np.sum(arr > 128) > 0:
-                        masks.append(arr)
-                except Exception:
-                    continue
-        if masks:
-            mask_arr = select_best_mask(masks, SD_SIZE, SD_SIZE)
-    except Exception:
-        mask_arr = None
-
-    # 5. Build mask
-    if mask_arr is not None:
-        mask_sd = dilate_mask(mask_arr, pixels=8)
-    else:
-        mask_sd = create_center_mask(SD_SIZE, SD_SIZE, coverage=0.55)
-
-    # 6. Run ControlNet + Inpainting via SDXL
-    # We use controlnet-canny to preserve shape + inpainting mask for fabric
+    # 4. Single Replicate call: SD inpainting
     prompt, negative_prompt = build_prompt(material)
 
     try:
-        # Use controlnet with canny to preserve structure
         output = replicate.run(
-            "rossjillian/controlnet:795433b19458d0f4fa172a7ccf93178d2adb1cb8ab2ad6c8fdc33fdbcd49f477",
+            "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
             input={
-                "image": pil_to_data_uri(canny_image),
+                "image": pil_to_data_uri(sd_img),
+                "mask": pil_to_data_uri(sd_mask),
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "structure": "canny",
                 "num_inference_steps": 50,
                 "guidance_scale": 7.5,
-                "image_resolution": SD_SIZE,
+                "strength": 0.55,
             }
         )
-    except Exception as e1:
-        # Fallback to plain inpainting if controlnet fails
-        try:
-            output = replicate.run(
-                "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
-                input={
-                    "image": pil_to_data_uri(sd_image),
-                    "mask": pil_to_data_uri(mask_sd),
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "num_inference_steps": 50,
-                    "guidance_scale": 7.5,
-                    "strength": 0.50,
-                }
-            )
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=f"Error en generacion: {str(e2)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en generacion: {str(e)}")
 
-    # 7. Get result URL
+    # 5. Get result URL
     output_list = list(output) if not isinstance(output, list) else output
     if not output_list:
-        raise HTTPException(status_code=500, detail="No se obtuvo imagen de resultado")
+        raise HTTPException(status_code=500, detail="No se obtuvo resultado")
 
     first = output_list[0]
     result_url = first if isinstance(first, str) else getattr(first, "url", str(first))
     if not result_url.startswith("http"):
-        raise HTTPException(status_code=500, detail="URL de resultado invalida")
+        raise HTTPException(status_code=500, detail="URL invalida")
 
-    # 8. Download result and restore original dimensions
+    # 6. Composite: paste result only within mask, keep original background
     result_bytes = await download_bytes(result_url)
-    result_sd = Image.open(BytesIO(result_bytes)).convert("RGB")
+    result_sd = Image.open(BytesIO(result_bytes)).convert("RGB").resize((SD_SIZE, SD_SIZE), Image.LANCZOS)
 
-    # Composite: only apply result within mask, keep background from original
-    result_sd_resized = result_sd.resize((SD_SIZE, SD_SIZE), Image.LANCZOS)
-    mask_rgba = mask_sd.convert("L")
-    composite = Image.composite(result_sd_resized, sd_image, mask_rgba)
+    composite_sd = Image.composite(result_sd, sd_img, sd_mask)
 
-    # Restore original proportions (undo padding, restore original size)
-    final_image = crop_and_resize_result(composite, offsets, orig_size)
-
-    result_b64 = image_to_base64(final_image)
+    # 7. Restore original dimensions
+    final = restore_from_sd(composite_sd, offsets, orig_size)
+    result_b64 = image_to_base64(final)
 
     return JSONResponse({
         "result_image": result_b64,
-        "width": final_image.width,
-        "height": final_image.height,
+        "width": final.width,
+        "height": final.height,
     })
