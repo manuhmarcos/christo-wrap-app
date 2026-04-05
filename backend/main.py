@@ -70,20 +70,22 @@ def dilate_mask(mask_arr: np.ndarray, pixels: int = 20) -> Image.Image:
 def build_inpaint_prompt(material: str) -> tuple[str, str]:
     prompts = {
         "tela": (
-            "object completely wrapped and covered in flowing white fabric cloth, "
-            "tied with thick rope and twine, photorealistic, Christo and Jeanne-Claude "
-            "art installation style, soft natural fabric folds and wrinkles, "
-            "dramatic natural lighting, ultra detailed 8K photography, "
-            "seamless wrapping covering entire object",
-            "ugly, blurry, low quality, deformed, text, watermark, cartoon, "
-            "painting, illustration, fake, unrealistic, exposed object underneath"
+            "the same object wrapped in white linen fabric cloth tied with rope, "
+            "exactly the same shape and silhouette as the original object but covered in fabric, "
+            "Christo and Jeanne-Claude art installation, fabric follows the contours of the object, "
+            "soft folds and wrinkles in cloth, photorealistic photography, natural lighting, "
+            "the outline and form of the object is clearly visible under the fabric",
+            "ugly, blurry, low quality, deformed, text, watermark, cartoon, painting, "
+            "different shape, reshaped object, blob, amorphous, changed silhouette"
         ),
         "plastico": (
-            "object completely wrapped in shiny polypropylene plastic sheeting, "
-            "tied with thick nylon rope, photorealistic, Christo and Jeanne-Claude "
-            "art installation style, plastic reflections and highlights, "
-            "dramatic lighting, ultra detailed 8K photography",
-            "ugly, blurry, low quality, deformed, text, watermark, cartoon, painting"
+            "the same object wrapped in transparent polypropylene plastic sheeting tied with nylon rope, "
+            "exactly the same shape and silhouette as the original object but covered in plastic, "
+            "Christo and Jeanne-Claude art installation, plastic follows the contours of the object, "
+            "photorealistic photography, natural lighting, "
+            "the outline and form of the object is clearly visible under the plastic",
+            "ugly, blurry, low quality, deformed, text, watermark, cartoon, painting, "
+            "different shape, reshaped object, blob, amorphous, changed silhouette"
         ),
     }
     return prompts.get(material, prompts["tela"])
@@ -107,7 +109,11 @@ async def wrap_object(
     # 1. Read and validate image
     contents = await file.read()
     try:
-        original_image = Image.open(BytesIO(contents)).convert("RGB")
+        original_image = Image.open(BytesIO(contents))
+        # Fix EXIF rotation (photos taken with phone are often rotated)
+        from PIL import ImageOps
+        original_image = ImageOps.exif_transpose(original_image)
+        original_image = original_image.convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Imagen invalida")
 
@@ -182,10 +188,10 @@ async def wrap_object(
 
     # 3. Build mask (from SAM or fallback ellipse)
     if mask_arr is not None:
-        mask_pil = dilate_mask(mask_arr, pixels=30)
+        mask_pil = dilate_mask(mask_arr, pixels=10)  # Less dilation = tighter to object shape
     else:
         # Fallback: use center ellipse mask
-        mask_pil = create_center_mask(width, height, coverage=0.65)
+        mask_pil = create_center_mask(width, height, coverage=0.55)
 
     mask_b64 = image_to_base64(mask_pil, fmt="PNG")
     mask_data_uri = f"data:image/png;base64,{mask_b64}"
@@ -202,8 +208,8 @@ async def wrap_object(
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
                 "num_inference_steps": 50,
-                "guidance_scale": 8.5,
-                "strength": 0.99,
+                "guidance_scale": 7.5,
+                "strength": 0.75,
             }
         )
     except Exception as e:
