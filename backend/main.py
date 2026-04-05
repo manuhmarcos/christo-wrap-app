@@ -120,15 +120,25 @@ def restore(img_sd: Image.Image, offsets, orig_size) -> Image.Image:
 def build_prompt(material: str):
     if material == "plastico":
         pos = (
-            "surface covered with shiny transparent polypropylene plastic wrap tied with nylon rope, "
-            "Christo and Jeanne-Claude wrapping, plastic texture, photorealistic"
+            "object wrapped in shiny silver polypropylene plastic sheeting, "
+            "thick nylon rope tied around it in Christo and Jeanne-Claude style, "
+            "plastic wrap with realistic reflections and creases, "
+            "professional art installation photography, dramatic side lighting, "
+            "the wrapped bundle shape clearly shows the object underneath"
         )
     else:
         pos = (
-            "surface covered with white linen cloth fabric tied with thick rope, "
-            "Christo and Jeanne-Claude fabric wrapping, soft folds in cloth, photorealistic"
+            "object wrapped in off-white linen canvas fabric, "
+            "thick nautical rope tied around it in Christo and Jeanne-Claude style, "
+            "fabric with realistic folds draping and wrinkles following the object shape, "
+            "professional art installation photography, dramatic side lighting, "
+            "the wrapped bundle shape clearly shows the object underneath"
         )
-    neg = "deformed, different shape, reshaped silhouette, ugly, blurry, cartoon, text, watermark"
+    neg = (
+        "naked object, unwrapped, no fabric, no cloth, no rope, "
+        "deformed, melted, blob shape, ugly, blurry, cartoon, painting, text, watermark, "
+        "different background, floating"
+    )
     return pos, neg
 
 
@@ -159,12 +169,7 @@ async def wrap_object(file: UploadFile = File(...), material: str = "tela"):
     # 3. Resize to SD canvas
     sd_img, offsets = resize_for_sd(pil)
 
-    # 4. Build TWO masks:
-    #    - interior_mask  → used for inpainting (eroded heavily, excludes object edges)
-    #    - full_mask      → used for final compositing (full object area)
-    #
-    # KEY INSIGHT: by only inpainting the INTERIOR, SD is forced to connect with the
-    # original edge pixels → the silhouette is perfectly preserved.
+    # 4. Build inpainting mask = full object area (smooth edges for blending)
     fg_sd = np.array(
         Image.fromarray(fg_mask).resize((offsets[2], offsets[3]), Image.NEAREST)
     )
@@ -172,27 +177,23 @@ async def wrap_object(file: UploadFile = File(...), material: str = "tela"):
     fg_canvas = np.zeros((SD_SIZE, SD_SIZE), np.uint8)
     fg_canvas[oy:oy+nh, ox:ox+nw] = fg_sd
 
-    # Interior mask: aggressively eroded so edges of object are NOT inpainted
-    erode_px = max(8, int(min(nw, nh) * 0.06))   # ~6% of object size
-    interior_np  = erode_mask(fg_canvas, erode_px)
-    interior_mask = smooth_mask(interior_np, blur=5)
+    inpaint_mask = smooth_mask(fg_canvas, blur=5)
 
-    # Full mask for final composite (slight smooth only)
-    full_mask = smooth_mask(fg_canvas, blur=7)
-
-    # 5. Single Replicate call: inpaint only the interior
+    # 5. Single Replicate call
+    # strength=0.82: strong enough to generate real fabric texture + folds,
+    # low enough that SD still uses the original structure as reference → shape preserved
     prompt, neg = build_prompt(material)
     try:
         output = replicate.run(
             "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
             input={
                 "image":           pil_to_data_uri(sd_img),
-                "mask":            pil_to_data_uri(interior_mask),
+                "mask":            pil_to_data_uri(inpaint_mask),
                 "prompt":          prompt,
                 "negative_prompt": neg,
                 "num_inference_steps": 50,
-                "guidance_scale":  7.5,
-                "strength":        0.85,   # high inside interior (far from edges)
+                "guidance_scale":  9.0,
+                "strength":        0.82,
             }
         )
     except Exception as e:
@@ -210,9 +211,8 @@ async def wrap_object(file: UploadFile = File(...), material: str = "tela"):
     result_bytes = await download_bytes(url)
     result_sd = Image.open(BytesIO(result_bytes)).convert("RGB").resize((SD_SIZE, SD_SIZE))
 
-    # 7. Composite: fabric result inside full object mask, original outside
-    #    This ensures: background = untouched, edges = original, interior = fabric
-    composite_sd = Image.composite(result_sd, sd_img, full_mask)
+    # 7. Composite: fabric inside mask, original background outside
+    composite_sd = Image.composite(result_sd, sd_img, inpaint_mask)
 
     # 8. Restore original dimensions
     final = restore(composite_sd, offsets, orig_size)
